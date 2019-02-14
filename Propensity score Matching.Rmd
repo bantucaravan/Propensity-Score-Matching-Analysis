@@ -1,0 +1,472 @@
+---
+title: "R Notebook"
+output: pdf_document
+---
+## Set up
+```{r}
+libs <- c('MatchIt', "ggplot2")
+needed <- setdiff(libs, .packages(all = TRUE))
+if (length(needed) > 0) {install.packages(needed); print("Yay!")}
+for (lib in libs) {library(lib, character.only = TRUE)}
+
+```
+
+
+## Data Generation
+```{r}
+set.seed(123)
+
+N = 5000
+a = rnorm(N)
+b = rnorm(N)
+
+# True Treatment effect = 2 (i.e. 102-100, the other parts just add noise of        
+# differing variance)
+# note: y1 has twice the slope of y0 on both variables. But we are only interested in
+# the AVERAGE binary treatment effect over all levels of a and b, rather than       
+# prediction accuracy at particular levels (at which treatment effect may vary      
+# greatly from its avg as it does here). The ATE is equivalent to the difference of 
+# in y-intercept  bc our data (both variables a and b) are centered around x=0      
+# because they are drawn from ~N(0,1) dist.
+y1 = 102 + 6*a + 4*b + rnorm(N)
+y0 = 100 + 3*a + 2*b + rnorm(N)
+
+u = (a+b)/2 # why divide by 2?
+p_d_given_a_b = plogis(u)
+d = rbinom(rep(1,N), 1, p_d_given_a_b)
+
+y = d * y1 + (1-d) * y0
+  
+data = data.frame(d, y, a, b, u)
+
+sum(d)/length(d)
+# 50.14% in treatment group
+```
+
+
+
+## naive estimate (of ATE?), no cofounds controlled for
+```{r}
+# the coefficient for D represents the niave treatment effect
+
+model = lm(y ~ d, data)
+summary(model)
+```
+
+
+## regression with conditioning estimate of ATE
+```{r}
+model <- lm(y ~ d+a+b, data)
+summary(model)
+# d coef = 1.96058
+# this is close to accurate!
+
+# look at data by treatent status
+ggplot(data) +
+  geom_point(aes(x=u, y=y, col= factor(d)), alpha = .5) +
+  geom_line(aes(x = u, y=predict(model), group=d, col= factor(d))) #+
+  #geom_line(aes(x = u, y=predict(model2), group=d), col= "orange")
+
+```
+
+
+
+## Manual Pronensity score
+
+### Create propensity scores
+```{r}
+
+fit <-  glm(d~a+b, family = binomial(link = "logit"), data)
+propensity <- predict(fit, type = "response") # P(D | Zs)
+data$ps <- propensity
+
+
+```
+
+
+## Check Shared Support on propensity scores between treatment and control
+```{r}
+# overlapping histogram
+ggplot() +
+  geom_histogram(data = data, mapping = aes(x= ps, fill = as.factor(d)), alpha = .7, position= "identity")
+
+# identical result
+ggplot() +
+  geom_histogram(data = data[data$d == 1,], mapping = aes(x= ps), alpha = .5, fill = "red") +
+  geom_histogram(data = data[data$d == 0,], mapping = aes(x= ps), alpha = .5, fill = "blue")
+
+# percent of data unsupported
+ shared_suport <- sort(c(range(data[data$d == 1, "ps"]), range(data[data$d == 0, "ps"])))[2:3]
+ unsupported_rows <- (data$ps < shared_suport[1]) |  (data$ps > shared_suport[2])
+# percent of data unsupported
+ (sum(unsupported_rows)/nrow(data)) * 100
+# 0.82% .. under 1 percent of data set is unsupported
+
+```
+
+
+### Match controls to treatment
+
+```{r}
+# Q: why can't we just match without propensity scores using knn in the Z vars?
+
+###
+match <- function(data, D_col, PS_col) {
+  treated <- data[data[D_col] == 1,]
+  control <- data[data[D_col] == 0,]
+
+  nearest <- function(cell, match_with = c("treated", "control")){
+    assignment <- match.arg(match_with)
+    df <- list(treated = treated, control = control)[[assignment]]
+    nearest_loc <- which.min(abs(cell - df[[PS_col]]))
+    nearest_loc
+  }
+  
+  # match controls to treateds
+  treated$matched_controls_idx <- apply(treated[PS_col], 1, function(cell){nearest(cell, "control")})
+  
+  treated$matched_controls_y <- control$y[treated$matched_controls_idx]
+  
+  # match treateds to controls
+  control$matched_treateds_idx <- apply(control[PS_col], 1, function(cell){nearest(cell, "treated")})
+  
+  control$matched_treateds_y <- treated$y[control$matched_treateds_idx]
+  
+  list(treated = treated, control = control)
+}
+
+#####
+
+get_estimates <- function(matched_out) {
+  stopifnot("list" %in% class(matched_out))
+  stopifnot(c("treated", "control") %in% names(matched_out))
+  #stopifnot(c("d", "y"))
+  
+  # ATT
+  y1_d1 <- mean(matched_out$treated$y)
+  y0_d1_hat <- mean(matched_out$treated$matched_controls_y)
+  ATT <- y1_d1 - y0_d1_hat
+  
+  #ATC
+  y1_d0_hat <- mean(matched_out$control$matched_treateds_y)
+  y0_d0 <- mean(matched_out$control$y)
+  ATC <- y1_d0_hat - y0_d0
+  
+  #ATE
+  all <- rbind(matched_out$treated[,1:6], matched_out$control[,1:6])
+  all$y1 <- all$y
+  all$y0 <- all$y
+  all[all$d ==1, "y0"] <- matched_out$treated$matched_controls_y
+  all[all$d ==0, "y1"] <- matched_out$control$matched_treateds_y
+  ATE <- mean(all$y1 - all$y0)
+  
+  return(list(ATT = ATT, ATC = ATC, ATE = ATE))
+}
+#####
+
+test <- match(data, D_col = "d", PS_col = "ps")
+
+## Check balance
+# for "a" var
+mean(test$treated$a) - mean(test$control$a[test$treated$matched_controls_idx])
+# -0.0154599 ... fairly close to zero
+
+
+## get ATT, ATC, and ATE estimates
+
+y1_d1 <- mean(test$treated$y)
+y0_d1_hat <- mean(test$treated$matched_controls_y)
+ATT <- y1_d1 - y0_d1_hat
+# 3.166293... i.e. correct treatment
+
+y1_d0_hat <- mean(test$control$matched_treateds_y)
+y0_d0 <- mean(test$control$y)
+ATC <- y1_d0_hat - y0_d0
+# 0.7619367
+
+
+##!!!!### is this a weighted avg?.. NO itseems
+ATE <- (ATT + ATC)/2
+# 1.964115 ... quite close to 2
+
+
+all <- rbind(test$treated[,1:6], test$control[,1:6])
+
+all$y1 <- all$y
+all$y0 <- all$y
+all[all$d ==1, "y0"] <- test$treated$matched_controls_y
+all[all$d ==0, "y1"] <- test$control$matched_treateds_y
+
+mean(all$y1 - all$y0)
+# 1.967481... even slightly closer! 
+# The difference from ATE calculated from ATT and ATC above is likely due to the this
+# being ineffect a weighted avg of ATT and ATC based on the slight imbalance in the 
+# size of the treatment and control groups
+
+```
+
+
+
+
+
+## Calculate ATT, ATC (, ATE) with Matchit package
+
+### Match control units to treatment units to approximate hypothetical Y_0 of treated units and visa versa
+```{r}
+  # att model
+ result <- matchit(d ~ a + b, data, method = "nearest", distance = "logit", replace=TRUE)
+  matched_data_att = match.data(result)
+  att_model = lm(y ~ d, data=matched_data_att, weights=matched_data_att$weights)
+  
+  
+  # atc model
+  data$d <- (data$d + 1) %% 2  # flip the assignment to match treatement to control
+  result <- matchit(d ~ a + b, data, method = "nearest", distance = "logit", replace=TRUE)
+  matched_data_atc = match.data(result)
+  data$d <- (data$d + 1) %% 2  # flip it back for further use
+  matched_data_atc$d <- (matched_data_atc$d + 1) %% 2  # revert to get correct treatment effect estimates
+  atc_model = lm(y ~ d, data=matched_data_atc, weights=matched_data_atc$weights)
+  
+  #atc_estimates[[i]]<-atc_model$coefficients[[2]]
+  #att_estimates[[i]]<-att_model$coefficients[[2]]
+  #att_errs[[i]]<-coef(summary(att_model))[,2][[2]]
+  #atc_errs[[i]]<-coef(summary(atc_model))[,2][[2]]
+
+```
+
+### check balance of Zs between groups
+```{r}
+summary(result)
+```
+
+
+###  avg both groups and take difference to get ATT
+```{r}
+
+atc_model$coefficients[[2]]
+# 0.7619367... literally identical to my manual values!!
+
+att_model$coefficients[[2]]
+# 3.166293
+
+
+# identical
+matched_data_att$weighted_y = matched_data_att$weights * matched_data_att$y
+disp <- aggregate(matched_data_att[,c("d","weighted_y")], list(matched_data_att$d), mean)
+# y1_d1 - y0_d1
+disp[2,3] - disp[1,3]
+# ATT
+# 3.166293 
+
+# identical
+model <- lm(weighted_y ~ d, data = matched_data_att)
+summary(model)
+
+```
+
+### Is PSM more robust to Treatment/Control imbalance due to Selection Bias??: YES!
+```{r}
+### Data Generation
+set.seed(123)
+
+N = 5000
+a = rnorm(N)
+b = rnorm(N)
+
+# True Treatment effect = 2 (i.e. 102-100, the other parts just add noise of differing variance)
+# note: y1 has twice the slope of y0 on both variables. But we are only interested in
+# the AVERAGE binary treatment effect, rather than prediction accuracy at all levels
+y1 = 102 + 6*a + 4*b + rnorm(N)
+y0 = 100 + 3*a + 2*b + rnorm(N)
+
+u = (a+b)/2 # why divide by 2?
+p_d_given_a_b = plogis((2*u)-3) # multiply to make curve steeper and substract 3 to  # shift probabilities toward 0
+d = rbinom(rep(1,N), 1, p_d_given_a_b)
+
+y = d * y1 + (1-d) * y0
+  
+data = data.frame(d, y, a, b, u)
+
+sum(d)/length(d)
+# 8.82% in treatment group
+
+
+### Regression w/ conditioning estimate of ATE
+model1 <- lm(y ~ d+a+b, data)
+summary(model1)
+# beta_d == 5.55926 ... way bigger than 2
+
+#however if we use interactions....
+# note: I only know that d:a and d:b interactions are necessary and useful but not  
+# a:b (which might cause over fitting...maybe), because I know the data generation  
+# process and I have seen the graph.. This is unrealistic
+model2 <- lm(y ~ d+a+b+d:a+d:b, data)
+summary(model2)
+# beta_d == 2.08545 ... very close to True value! because model adapts to the data   # better... will this cause real world over fitting problems...?
+  
+# look at data by treatent status
+ggplot(data) +
+  geom_point(aes(x=u, y=y, col= factor(d)), alpha = .5) +
+  geom_line(aes(x = u, y=predict(model1), group=d), col="purple") +
+  geom_line(aes(x = u, y=predict(model2), group=d), col= "orange")
+  
+
+### PSM estimate of ATE
+# make sure to read in the match() function from above first
+# make propensity scores
+fit <-  glm(d~a+b, family = binomial(link = "logit"), data)
+propensity <- predict(fit, type = "response") # P(D | Zs)
+data$ps <- propensity
+
+# check shared support of treatment and control on Propensity Scores
+# overlapping hists plot
+ggplot() +
+  geom_histogram(data = data, mapping = aes(x= ps, fill = as.factor(d)), alpha = .7, position= "identity")
+# percent of data unsupported
+shared_suport <- sort(c(range(data[data$d == 1, "ps"]), range(data[data$d == 0, "ps"])))[2:3]
+unsupported_rows <- (data$ps < shared_suport[1]) |  (data$ps > shared_suport[2])
+(sum(unsupported_rows)/nrow(data)) * 100
+# 2.08% of data set is unsupported... pretty good!
+
+# match treatments and controls
+matched <- match(data, D_col = "d", PS_col = "ps")
+
+# ATE, ATT, ATC
+estimates <- get_estimates(matched)
+
+estimates$ATE  
+ # 2.080637 ... very close to true value of 2!
+estimates$ATT 
+# 5.888378 ... ok we believe this... close to the reg w/ cond estimate under these conditions
+estimates$ATC
+# 1.712308 .. close to two.. this shows that most of the data in the control
+
+ 
+ ## conclusion: PSM preforms much better than regression with condition with a      
+# heavily imbalanced dataset, due to selection bias misleading the regression.
+# Further we see that ATT only gives info on the treatment group that is selected with its selection bias.
+
+
+```
+
+
+
+
+
+### doing cond regression on a data matrix that is biased....
+```{r}
+
+test <- lm(weighted_y ~ d + a + b, data = matched_data_att) # correct matched data?
+summary(test)
+# d estimate -2.6863
+
+
+
+# why is ths so far from the true value of two 2.. bc it is based off a data matrix
+# made up of only the y0_d1_hat approximated values gotten by nearest neighbors on
+# propensity scores matched to y1_d1 treatments units... no pairing of control and
+# approximated y1_d0_hat values... so the specification doesn't make theoretical
+# sense as an estimation of ATE
+diff <- predict(test, data.frame(d=c(1,0), a= mean(matched_data_att$a), b = mean(matched_data_att$b)))
+# -2.686343
+
+```
+
+
+
+### Is conditioning reggression or PSM more accurate??: balanced treatment and control
+```{r}
+
+cond_reg_ATEs <- list()
+PSM_ATEs <- list()
+sample_ATE <- list()
+for (n in 1:500) {
+  
+  ## Data generation
+  N = 5000
+  a = rnorm(N)
+  b = rnorm(N)
+
+  # True Treatment effect = 2 (i.e. 102-100, the other parts just add noise of
+  # differing variance)
+  y1 = 102 + 6*a + 4*b + rnorm(N)
+  y0 = 100 + 3*a + 2*b + rnorm(N)
+
+
+  u = (a+b)/2
+
+  p_d_given_a_b = plogis(u)
+  d = rbinom(rep(1,N), 1, p_d_given_a_b)
+
+  y = d * y1 + (1-d) * y0
+  
+  data = data.frame(d, y, a, b, u)
+  
+  # record sample ATE
+  sample_ATE[n] <- mean(y1-y0)
+  
+  ## get conditioning regression ATEs
+  cond_model <- lm(y ~ d+a+b, data)
+  cond_reg_ATEs[n] <- cond_model$coefficients[2]
+  
+  ## Get PSM ATEs
+  # make sure to read in the match() function from above first
+  
+  # make propensity scores
+  fit <-  glm(d~a+b, family = binomial(link = "logit"), data)
+  propensity <- predict(fit, type = "response") # P(D | Zs)
+  data$ps <- propensity
+  
+  # match treatments and controls
+  test <- match(data, D_col = "d", PS_col = "ps")
+  all <- rbind(test$treated[,1:6], test$control[,1:6])
+  all$y1 <- all$y
+  all$y0 <- all$y
+  all[all$d ==1, "y0"] <- test$treated$matched_controls_y
+  all[all$d ==0, "y1"] <- test$control$matched_treateds_y
+  
+  # get psm ATE
+  PSM_ATEs[n] <- mean(all$y1 - all$y0)
+  
+  
+  
+  
+}
+
+mean(unlist(sample_ATE))
+#2nd 2.004365
+
+mean(unlist(PSM_ATEs))
+# 2.007392 #2nd 2.010691
+sd(unlist(PSM_ATEs))
+# 0.06748241 #2nd 0.06430236
+
+mean(unlist(cond_reg_ATEs))
+# 2.001612 #2nd 2.004621
+sd(unlist(cond_reg_ATEs))
+# 0.06747916 #2nd 0.06216361
+
+# So it seems that over this sample there is slightly less bias in the conditioning
+# regression appoach and pretty much identical variance...
+
+
+mean(unlist(sample_ATE) - unlist(PSM_ATEs))
+#2nd -0.006326656
+sd(unlist(sample_ATE) - unlist(PSM_ATEs))
+#2nd 0.03475738
+#MSE 
+var(unlist(sample_ATE) - unlist(PSM_ATEs)) + mean(unlist(sample_ATE) - unlist(PSM_ATEs))^2
+#2nd MSE 0.001248102
+
+mean(unlist(sample_ATE) - unlist(cond_reg_ATEs))
+#2nd -0.0002565596
+sd(unlist(sample_ATE) - unlist(cond_reg_ATEs))
+# 0.04312974
+var(unlist(sample_ATE) - unlist(cond_reg_ATEs)) + mean(unlist(sample_ATE) - unlist(cond_reg_ATEs))^2
+#2nd MSE  0.00186024 ... but now this way of calculating MSE says PSM has lower
+#MSE..? essentially bc more variance...
+
+```
+
+
+
